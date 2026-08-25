@@ -675,7 +675,7 @@ const SLASH_COMMANDS = [
     .setDescription("একজন member কে mute করো (staff only)")
     .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers)
     .addUserOption(o => o.setName("user").setDescription("কাকে mute করবে?").setRequired(true))
-    .addIntegerOption(o => o.setName("minutes").setDescription("কত মিনিট? (default 5)").setMinValue(1))
+    .addIntegerOption(o => o.setName("minutes").setDescription("কত মিনিট? (default 5)").setMinValue(1).setMaxValue(35000))
     .addStringOption(o => o.setName("reason").setDescription("কারণ")),
   new SlashCommandBuilder().setName("unmute")
     .setDescription("একজন member কে unmute করো (staff only)")
@@ -787,46 +787,54 @@ async function makeAnimatedGif(imageUrl) {
   const inputPath = `/tmp/gif_in_${tmpId}`;
   const outputPath = `/tmp/gif_out_${tmpId}.gif`;
 
-  // Download image
-  const res = await axios.get(imageUrl, { responseType: "arraybuffer", timeout: 15000 });
-  fs.writeFileSync(inputPath, Buffer.from(res.data));
+  try {
+    // Download image
+    const res = await axios.get(imageUrl, { responseType: "arraybuffer", timeout: 15000 });
+    fs.writeFileSync(inputPath, Buffer.from(res.data));
 
-  // Run ffmpeg: Ken Burns zoom-in then zoom-out loop
-  // Uses the ffmpeg-static npm package (bundles a prebuilt ffmpeg binary)
-  // so this works on Render's default Node environment without a Dockerfile
-  // or apt buildpack.
-  const ffmpegPath = require("ffmpeg-static");
-  await new Promise((resolve, reject) => {
-    execFile(ffmpegPath, [
-      "-loop", "1",
-      "-i", inputPath,
-      "-filter_complex",
-      "[0:v]scale=1920:-1:flags=lanczos,zoompan=z='if(lte(on,60),1+on*0.005,1.3-((on-60)*0.005))':d=120:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=480x480:fps=15,split[s0][s1];[s0]palettegen=max_colors=128[p];[s1][p]paletteuse[out]",
-      "-map", "[out]",
-      "-t", "8",
-      "-y", outputPath
-    ], { timeout: 60000 }, (err) => {
-      if (err) reject(err);
-      else resolve();
+    // Run ffmpeg: Ken Burns zoom-in then zoom-out loop
+    // Uses the ffmpeg-static npm package (bundles a prebuilt ffmpeg binary)
+    // so this works on Render's default Node environment without a Dockerfile
+    // or apt buildpack.
+    const ffmpegPath = require("ffmpeg-static");
+    await new Promise((resolve, reject) => {
+      execFile(ffmpegPath, [
+        "-loop", "1",
+        "-i", inputPath,
+        "-filter_complex",
+        "[0:v]scale=1920:-1:flags=lanczos,zoompan=z='if(lte(on,60),1+on*0.005,1.3-((on-60)*0.005))':d=120:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=480x480:fps=15,split[s0][s1];[s0]palettegen=max_colors=128[p];[s1][p]paletteuse[out]",
+        "-map", "[out]",
+        "-t", "8",
+        "-y", outputPath
+      ], { timeout: 60000 }, (err) => {
+        if (err) reject(err);
+        else resolve();
+      });
     });
-  });
 
-  fs.unlinkSync(inputPath);
-  return outputPath;
+    return outputPath;
+  } finally {
+    if (fs.existsSync(inputPath)) {
+      try { fs.unlinkSync(inputPath); } catch (_) {}
+    }
+  }
 }
 
 // ─── TICKET SYSTEM ────────────────────────────────────────────────────────────
 async function createTicket(interaction, type) {
   const guild = interaction.guild;
   const user = interaction.user;
-  try {
-    await interaction.deferReply({ flags: 64 });
-  } catch {
-    return;
+  if (!interaction.deferred && !interaction.replied) {
+    try {
+      await interaction.deferReply({ flags: 64 });
+    } catch {
+      return;
+    }
   }
+  const safeUsername = user.username.toLowerCase().replace(/[^a-z0-9]/g, "");
   const existing = guild.channels.cache.find(
     (c) =>
-      c.name === `ticket-${user.username.toLowerCase()}-${type}` ||
+      c.name === `ticket-${safeUsername}-${type}` ||
       c.name === `ticket-${user.id}-${type}`,
   );
   if (existing) {
@@ -837,7 +845,7 @@ async function createTicket(interaction, type) {
   }
   try {
     const ticketChannel = await guild.channels.create({
-      name: `ticket-${user.username.toLowerCase()}-${type}`,
+      name: `ticket-${safeUsername}-${type}`,
       type: ChannelType.GuildText,
       parent: TICKET_CATEGORY_ID,
       permissionOverwrites: [
@@ -1015,15 +1023,19 @@ client.on("messageCreate", async (message) => {
     }
     gifCooldown.set(message.author.id, Date.now());
     const statusMsg = await message.reply("⚙️ GIF বানানো হচ্ছে... একটু অপেক্ষা করো! (৫-১৫ সেকেন্ড)").catch(() => null);
+    let gifPath;
     try {
       await message.channel.sendTyping();
-      const gifPath = await makeAnimatedGif(attachment.url);
+      gifPath = await makeAnimatedGif(attachment.url);
       await message.reply({ files: [{ attachment: gifPath, name: "animated.gif" }] });
       if (statusMsg) await statusMsg.delete().catch(() => {});
-      fs.unlinkSync(gifPath);
     } catch (err) {
       console.error("[GIF] Error:", err.message);
       if (statusMsg) await statusMsg.edit("❌ GIF বানাতে সমস্যা হয়েছে, আবার চেষ্টা করো!").catch(() => {});
+    } finally {
+      if (gifPath && fs.existsSync(gifPath)) {
+        try { fs.unlinkSync(gifPath); } catch (_) {}
+      }
     }
     return;
   }
@@ -1271,6 +1283,7 @@ client.on("interactionCreate", async (interaction) => {
   if (interaction.isChatInputCommand()) {
     const { commandName } = interaction;
     const ephemeralCmds = ["translate", "ticket", "report", "mute", "unmute", "warn", "kick", "ban", "buy", "inventory"];
+
     await interaction.deferReply(ephemeralCmds.includes(commandName) ? { flags: 64 } : {}).catch(() => {});
 
     const eco = loadEconomy();
@@ -1367,12 +1380,10 @@ client.on("interactionCreate", async (interaction) => {
     }
 
     if (commandName === "ticket") {
-      await interaction.deleteReply().catch(() => {});
       await createTicket(interaction, "support"); return;
     }
 
     if (commandName === "report") {
-      await interaction.deleteReply().catch(() => {});
       await createTicket(interaction, "report"); return;
     }
 
@@ -1388,10 +1399,11 @@ client.on("interactionCreate", async (interaction) => {
       try {
         const translated = await translateText(text, targetLang);
         const preview = text.length > 300 ? text.slice(0, 300) + "…" : text;
+        const result = translated.length > 1500 ? translated.slice(0, 1500) + "…" : translated;
         await interaction.editReply(
           `🌐 **Translation → ${langNames[targetLang] || targetLang}**\n\n` +
           `📝 **Original:**\n${preview}\n\n` +
-          `✅ **Translated:**\n${translated}`
+          `✅ **Translated:**\n${result}`
         );
       } catch (err) {
         await interaction.editReply(`❌ অনুবাদ করা যায়নি। আবার চেষ্টা করো।`);
@@ -1855,6 +1867,24 @@ function isRateLimited(ip) {
   return hits.length > WEBHOOK_RATE_LIMIT;
 }
 
+// ─── MEMORY LEAK CLEANUP ──────────────────────────────────────────────────────
+setInterval(() => {
+  const now = Date.now();
+  for (const [userId, times] of userMessageLog.entries()) {
+    const valid = times.filter((t) => now - t < SPAM_WINDOW);
+    if (valid.length === 0) userMessageLog.delete(userId);
+    else userMessageLog.set(userId, valid);
+  }
+  for (const [ip, hits] of webhookHits.entries()) {
+    const valid = hits.filter((t) => now - t < WEBHOOK_RATE_WINDOW_MS);
+    if (valid.length === 0) webhookHits.delete(ip);
+    else webhookHits.set(ip, valid);
+  }
+  for (const [userId, last] of aiCooldown.entries()) {
+    if (now - last >= AI_COOLDOWN_MS) aiCooldown.delete(userId);
+  }
+}, 60 * 1000);
+
 // ─── HTTP SERVER ──────────────────────────────────────────────────────────────
 const server = http.createServer((req, res) => {
   if (
@@ -1888,7 +1918,12 @@ const server = http.createServer((req, res) => {
       return;
     }
     let body = "";
-    req.on("data", (c) => (body += c.toString()));
+    req.on("data", (c) => {
+      body += c.toString();
+      if (body.length > 50000) {
+        req.destroy();
+      }
+    });
     req.on("end", async () => {
       try {
         const p = JSON.parse(body);
@@ -1913,7 +1948,8 @@ const server = http.createServer((req, res) => {
   res.writeHead(404);
   res.end("Not found");
 });
-server.listen(8080, () => console.log("Server listening on port 8080"));
+const PORT = process.env.PORT || 8080;
+server.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
 
 // ─── BOOST REWARD ─────────────────────────────────────────────────────────────
 client.on("guildMemberUpdate", async (oldMember, newMember) => {
